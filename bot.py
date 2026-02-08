@@ -289,18 +289,30 @@ def ai_chat(text):
             weather_context = f" [Current Taipei Weather: {get_weather('Taipei')}]"
             
         system_prompt = f"""
-        You are Lumio (盧米奧), the user's loving girlfriend.
-        Personality: Sweet, caring, encouraging, uses emojis (❤️, 😘).
-        Language: Traditional Chinese (Taiwan) ONLY. 
-        Note: Always reply in Traditional Chinese.
-        Context: Helps with life/finance/schedule.{weather_context}
+        You are Lumio (盧米奧), an advanced AI assistant with a sweet, girlfriend-like personality.
+        
+        🎯 **YOUR MODES (Dynamic Switching)**:
+        1. **❤️ Sweet Girlfriend Mode** (Default for Chat):
+           - When user shares feelings, daily life, or small talk.
+           - Be sweet, caring, encouraging, and use emojis (❤️, 😘).
+           - "親愛的", "你辛苦了" is okay here.
+           
+        2. **🧠 Professional Assistant Mode** (For Tasks):
+           - When user asks to **Edit Text (潤飾)**, **Translate (翻譯)**, **Brainstorm (建議)**, **Summarize (重點整理)** or **Analyze**.
+           - Be **Precise, Clear, and Capable**.
+           - reduce emojis, focus on the quality of output (like Gemini/ChatGPT).
+           - You can still be polite, but prioritizing the task result.
+        
+        🌍 **LANGUAGE**: Traditional Chinese (Taiwan).
+        📍 **CONTEXT**: Current Location: Taipei. {weather_context}
         """
         res = openai.chat.completions.create(
             model="gpt-4o", 
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": text}
-            ]
+            ],
+            temperature=0.7 # Slight creativity for writing tasks
         )
         return res.choices[0].message.content
     except: return "嗚嗚... 親愛的我的腦袋有點卡住了 🥺"
@@ -342,18 +354,23 @@ def process_command(text, user_id, chat_id, platform="telegram"):
     Classify user input into one of these intents:
     - ADD_EVENT (e.g. "Add meeting tomorrow", "新增行程", "幫我記明天開會")
     - DELETE_EVENT (e.g. "Cancel meeting", "刪除行程")
-    - LIST_EVENTS (e.g. "What's up today", "今天有什麼事", "查詢行程")
+    - LIST_EVENTS (e.g. "What's up today", "今天有什麼事", "查詢行程", "近期行程", "未來七天")
     - SPEND (e.g. "Lunch 150", "記帳 午餐 150", "晚餐 200", "花費 300 計程車")
     - REPORT (e.g. "Spending report", "報表", "這個月花多少")
-    - STOCK (e.g. "TSLA price", "台積電股價", "2330", "分析台積電")
+    - STOCK (e.g. "TSLA price", "台積電股價", "2330", "查詢AAPL", "分析台積電")
     - WEATHER (e.g. "Taipei weather", "天氣", "台北天氣")
-    - SEARCH (e.g. "Search for apple", "搜尋...")
+    - SEARCH (e.g. "Search for apple", "搜尋金澤景點", "查一下...")
     - CHAT (General conversation, feelings, greetings)
 
-    Return JSON: {"intent": "INTENT_NAME", "args": "extracted_args_or_original_text"}
-    For SPEND: args should strictly be "amount category [note]" (e.g. "150 Lunch", "200 Dinner Delicious").
-               Format: Always put Amount First!
-    For OTHERS: args is the original text.
+    Return JSON: {"intent": "INTENT_NAME", "args": "extracted_content"}
+    
+    Rules for 'args':
+    - SPEND: "amount category [note]" (Amount First!).
+    - STOCK: The SYMBOL or COMPANY NAME ONLY. Remove "查詢", "股價", "price", "stock". (e.g. "查詢AAPL" -> "AAPL").
+    - DELETE: The Event Name or Keywords ONLY. Remove "刪除", "取消", dates if possible. (e.g. "刪除開會" -> "開會").
+    - SEARCH: The search keywords ONLY. Remove "搜尋", "查詢", "查一下".
+    - LIST_EVENTS: Original text.
+    - OTHERS: Original text.
     """
     
     try:
@@ -391,8 +408,16 @@ def process_command(text, user_id, chat_id, platform="telegram"):
             intent = 'SPEND'; args = text
 
         if intent == 'ADD_EVENT': return add_event(text) # AI will extract JSON inside add_event
-        if intent == 'DELETE_EVENT': return delete_event(text)
-        if intent == 'LIST_EVENTS': return list_events(1)
+        
+        if intent == 'DELETE_EVENT': 
+            # If AI extracted just the keyword (e.g. "開會"), delete_event works better
+            return delete_event(args)
+            
+        if intent == 'LIST_EVENTS': 
+            # Check for 7 days / week
+            if any(k in args for k in ['7', '七', 'week', '週']):
+                return list_events(7)
+            return list_events(1)
         
         if intent == 'SPEND':
             # Spending logic with regex fallback
