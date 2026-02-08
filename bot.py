@@ -286,9 +286,9 @@ def search_web(q):
     # 3. GPT-4o Fallback
     if not results:
         try:
-            prompt = f"Search '{q}' failed. Provide a short summary based on knowledge."
+            prompt = f"User asked to search: '{q}', but search engines failed. Provide a comprehensive answer in Traditional Chinese (Taiwan) ONLY. Structure it clearly."
             res = openai.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}])
-            return f"⚠️ 搜尋無回應，AI 補充:\n\n{res.choices[0].message.content}"
+            return f"⚠️ 搜尋引擎無回應，AI 補充資訊:\n\n{res.choices[0].message.content}"
         except: return "❌ 搜尋功能暫時失效"
         
     return "🔍 **搜尋結果**:\n" + "\n".join(results)
