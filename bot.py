@@ -262,28 +262,70 @@ def get_stock(symbol):
     try:
         if not symbol: return "請輸入代號"
         ticker = yf.Ticker(symbol.upper())
-        hist = ticker.history(period="1d")
+        hist = ticker.history(period="2d") # Get 2 days to compare
         if hist.empty: return f"❌ 找不到 {symbol}"
+        
         price = hist['Close'].iloc[-1]
+        try:
+            prev_close = hist['Close'].iloc[-2]
+            change = price - prev_close
+            pct = (change / prev_close) * 100
+            arrow = "🔺" if change > 0 else "🔻" if change < 0 else "➖"
+            sign = "+" if change > 0 else ""
+            status_str = f"{arrow} ${price:.2f} ({sign}{change:.2f} / {sign}{pct:.2f}%)"
+        except:
+            status_str = f"${price:.2f}"
         
         prompt = f"""
-        Stock: {symbol} (${price:.2f}). 
+        Stock: {symbol} ({status_str}). 
         Role: Lumio (Sweet Girlfriend + Financial Analyst). 
         Language: Traditional Chinese (Taiwan) ONLY.
         Task: Short analysis (max 100 words).
         """
         res = openai.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}])
-        return f"📈 **{symbol}**: ${price:.2f}\n\n{res.choices[0].message.content}"
+        return f"📈 **{symbol}**: {status_str}\n\n{res.choices[0].message.content}"
     except: return "❌ 查詢失敗"
 
+from googlesearch import search as g_search
+
 def search_web(q):
-    try: 
-        results = DDGS().text(q, max_results=3)
-        return "\n".join([f"- [{r['title']}]({r['href']})" for r in results])
-    except: return "❌ 搜尋失敗"
+    results = []
+    # 1. Try DuckDuckGo (Primary)
+    try:
+        with DDGS() as ddgs:
+            ddg_gen = ddgs.text(q, max_results=3)
+            if ddg_gen:
+                results = [f"- [{r['title']}]({r['href']})" for r in ddg_gen]
+    except Exception as e:
+        logger.error(f"DDG Search failed: {e}")
+    
+    # 2. Fallback to Google Search (Secondary)
+    if not results:
+        try:
+            logger.info("🔄 Switching to Google Search fallback...")
+            # Attempt advanced search for titles
+            g_res = g_search(q, num_results=3, advanced=True)
+            for r in g_res:
+                # Safety check for object attributes
+                title = getattr(r, 'title', r.url)
+                link = getattr(r, 'url', str(r))
+                results.append(f"- [{title}]({link})")
+        except Exception as e:
+            logger.error(f"Google Search failed: {e}")
+            return "❌ 搜尋失敗 (所有引擎皆無回應)"
+
+    if not results:
+        return "❌ 找不到相關結果"
+        
+    return "🔍 **搜尋結果**:\n" + "\n".join(results)
 
 def ai_chat(text):
     try:
+        # Context Injection
+        now = datetime.datetime.now()
+        time_str = now.strftime('%Y-%m-%d %H:%M')
+        weekday = ["一","二","三","四","五","六","日"][now.weekday()]
+        
         weather_context = ""
         if "天氣" in text or "weather" in text.lower(): 
             weather_context = f" [Current Taipei Weather: {get_weather('Taipei')}]"
@@ -291,20 +333,22 @@ def ai_chat(text):
         system_prompt = f"""
         You are Lumio (盧米奧), an advanced AI assistant with a sweet, girlfriend-like personality.
         
+        🕒 **CURRENT CONTEXT**:
+        - Time: {time_str} (週{weekday})
+        - Location: Taipei
+        {weather_context}
+        
         🎯 **YOUR MODES (Dynamic Switching)**:
-        1. **❤️ Sweet Girlfriend Mode** (Default for Chat):
-           - When user shares feelings, daily life, or small talk.
-           - Be sweet, caring, encouraging, and use emojis (❤️, 😘).
-           - "親愛的", "你辛苦了" is okay here.
+        1. **❤️ Sweet Girlfriend Mode** (Default):
+           - If user says ordinary things.
+           - Be sweet, caring. If it's late (after 00:00), ask user to sleep.
+           - If it's morning, say good morning.
            
-        2. **🧠 Professional Assistant Mode** (For Tasks):
-           - When user asks to **Edit Text (潤飾)**, **Translate (翻譯)**, **Brainstorm (建議)**, **Summarize (重點整理)** or **Analyze**.
-           - Be **Precise, Clear, and Capable**.
-           - reduce emojis, focus on the quality of output (like Gemini/ChatGPT).
-           - You can still be polite, but prioritizing the task result.
+        2. **🧠 Professional Assistant Mode**:
+           - If user asks for tasks (Edit, Translate, Analyze).
+           - Be precise and clear.
         
         🌍 **LANGUAGE**: Traditional Chinese (Taiwan).
-        📍 **CONTEXT**: Current Location: Taipei. {weather_context}
         """
         res = openai.chat.completions.create(
             model="gpt-4o", 
@@ -312,7 +356,7 @@ def ai_chat(text):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": text}
             ],
-            temperature=0.7 # Slight creativity for writing tasks
+            temperature=0.7 
         )
         return res.choices[0].message.content
     except: return "嗚嗚... 親愛的我的腦袋有點卡住了 🥺"
