@@ -1,14 +1,14 @@
 
 import logging
 import os
-import requests
 import json
 import sqlite3
 import datetime
 import traceback
 import re
 import threading
-from datetime import date as dt_date
+import requests
+from datetime import date as dt_date, timedelta, timezone
 
 # --- Third Party Libraries ---
 from telegram import Update
@@ -25,14 +25,26 @@ from dotenv import load_dotenv
 import yfinance as yf
 from duckduckgo_search import DDGS
 
+# Robust Import for Google Search Fallback
+try:
+    from googlesearch import search as g_search
+except ImportError:
+    g_search = None
+
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from googleapiclient.discovery import build
 
 # =========================================
-#       CONFIGURATION & SETUP (V10.0)
+#       CONFIGURATION & SETUP (V13.0)
 # =========================================
 load_dotenv()
+
+# --- Timezone Setup (UTC+8) ---
+TZ_TAIPEI = timezone(timedelta(hours=8))
+
+def get_now():
+    return datetime.datetime.now(TZ_TAIPEI)
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -54,69 +66,42 @@ SPREADSHEET_NAME = "MyExpenses"
 if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 
-if not TELEGRAM_TOKEN and not LINE_CHANNEL_ACCESS_TOKEN:
-    logger.warning("⚠️ No Bot Tokens found! Check your .env file.")
-
-# --- Database ---
-DB_FILE = 'assistant.db'
-
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    # Create tables if not exist
-    c.execute('''CREATE TABLE IF NOT EXISTS todos (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, task TEXT, category TEXT DEFAULT 'general', status TEXT DEFAULT 'pending', created_at TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS reminders (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, chat_id INTEGER, remind_time TEXT, task TEXT, status TEXT DEFAULT 'pending')''')
-    c.execute('''CREATE TABLE IF NOT EXISTS notes (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, content TEXT, created_at TEXT)''')
-    conn.commit()
-    conn.close()
-
-init_db()
-
 # =========================================
-#       CORE LOGIC (The Brain)
+#       CORE LOGIC
 # =========================================
 
-# --- Google Credentials (Robust) ---
+# --- Google Credentials ---
 def get_google_creds():
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/calendar']
     
-    # Priority 1: Env Var (for Cloud Deployment)
+    # Priority 1: Env Var (Cloud)
     if GOOGLE_JSON_KEY:
         try:
-            # Handle possible newline escapes in env vars
             cleaned_json = GOOGLE_JSON_KEY.replace('\\n', '\n')
             creds_dict = json.loads(cleaned_json, strict=False)
             return ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         except Exception as e:
             logger.error(f"Google Env Key Error: {e}")
     
-    # Priority 2: Local File (for Local Dev)
+    # Priority 2: Local File
     if os.path.exists(GOOGLE_SHEET_JSON):
         return ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_SHEET_JSON, scope)
     
-    logger.error("❌ Google Credentials not found (Env or File).")
     return None
 
-# --- Accounting Logic ---
+# --- Accounting ---
 def add_to_google_sheet(date, category, amount, note):
     try:
         creds = get_google_creds()
         if not creds: return False
         
         client = gspread.authorize(creds)
-        try:
-            sh = client.open(SPREADSHEET_NAME)
-        except gspread.SpreadsheetNotFound:
-            print(f"❌ Spreadsheet '{SPREADSHEET_NAME}' not found.")
-            return False
+        try: sh = client.open(SPREADSHEET_NAME)
+        except: return False
 
         try: sheet = sh.worksheet("records")
         except: sheet = sh.sheet1
         
-        # Ensure Header
         try:
              if sheet.cell(1, 1).value != '日期': 
                  sheet.insert_row(['日期', '項目', '金額', '備註'], 1)
@@ -133,12 +118,11 @@ def get_monthly_report():
         creds = get_google_creds()
         if not creds: return "❌ 無法連接 Google Sheets"
         client = gspread.authorize(creds)
-        
         try: sheet = client.open(SPREADSHEET_NAME).worksheet("records")
         except: return "❌ 找不到 'records' 工作表"
 
         data = sheet.get_all_records()
-        current_month = datetime.datetime.now().strftime("%Y-%m")
+        current_month = get_now().strftime("%Y-%m")
         total = 0
         cat_total = {}
         
@@ -158,7 +142,7 @@ def get_monthly_report():
         return msg
     except Exception as e: return f"❌ 報表失敗: {e}"
 
-# --- Calendar Logic ---
+# --- Calendar ---
 def get_cal_service():
     creds = get_google_creds()
     if not creds: return None
@@ -171,22 +155,20 @@ def add_event(text):
         
         prompt = f"""
         Extract event from: '{text}'. 
-        Return ONLY valid JSON. No markdown.
+        Return ONLY valid JSON.
         Format: {{"summary": "Name", "start_time": "ISO8601 (Local Time)", "duration_minutes": 60}}
-        Ref Date: {datetime.datetime.now().strftime('%Y-%m-%d')}
+        Ref Date: {get_now().strftime('%Y-%m-%d')}
         timezone: Asia/Taipei
         """
         res = openai.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}])
         content = res.choices[0].message.content.strip()
         
-        # Robust JSON Extraction
         start_idx = content.find('{')
         end_idx = content.rfind('}')
         if start_idx != -1 and end_idx != -1:
-            json_str = content[start_idx : end_idx + 1]
-            js = json.loads(json_str)
+            js = json.loads(content[start_idx : end_idx + 1])
         else:
-            return f"❌ AI 無法理解行程: {content[:50]}"
+            return f"❌ AI 無法理解: {content[:50]}"
             
         start = datetime.datetime.fromisoformat(js['start_time'])
         end = start + datetime.timedelta(minutes=js.get('duration_minutes', 60))
@@ -209,32 +191,26 @@ def list_events(days=1):
         now = datetime.datetime.utcnow()
         end = now + datetime.timedelta(days=days)
         events = service.events().list(
-            calendarId=GOOGLE_CALENDAR_ID, 
-            timeMin=now.isoformat()+'Z', 
-            timeMax=end.isoformat()+'Z', 
-            singleEvents=True, 
-            orderBy='startTime'
+            calendarId=GOOGLE_CALENDAR_ID, timeMin=now.isoformat()+'Z', timeMax=end.isoformat()+'Z', 
+            singleEvents=True, orderBy='startTime'
         ).execute().get('items', [])
         
         if not events: return f"📅 未來 {days} 天無行程"
         msg = f"📅 **未來 {days} 天行程**:\n"
         for e in events:
-            start = e['start'].get('dateTime')
-            if start: 
+            start = e['start'].get('dateTime') or e['start'].get('date')
+            try:
                 dt = datetime.datetime.fromisoformat(start)
-                time_str = dt.strftime('%m/%d %H:%M')
-            else: 
-                start = e['start'].get('date')
+            except:
                 dt = datetime.datetime.strptime(start, '%Y-%m-%d')
-                time_str = dt.strftime('%m/%d (全天)')
             
             wd = ["一","二","三","四","五","六","日"][dt.weekday()]
+            time_str = dt.strftime('%m/%d %H:%M') if 'T' in start else dt.strftime('%m/%d (全天)')
             msg += f"• {time_str} ({wd}) {e['summary']}\n"
         return msg
     except Exception as e: return f"❌ 讀取失敗: {e}"
 
 def delete_event(query):
-    # Simplified search for deletion
     try:
         service = get_cal_service()
         now = datetime.datetime.utcnow().isoformat() + 'Z'
@@ -250,19 +226,22 @@ def delete_event(query):
     except Exception as e: return f"❌ 刪除失敗: {e}"
 
 def update_event(query):
-    return "🔄 更新功能尚未實裝 (建議刪除後重新建立)"
+    return "🔄 建議直接刪除後重新建立"
 
 # --- Tools ---
 def get_weather(location="Taipei"):
     try:
-        return requests.get(f"https://wttr.in/{location}?format=%l:+%c+%t+(%h)", timeout=5).text.strip()
-    except: return "無法取得天氣"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get(f"https://wttr.in/{location}?format=%l:+%c+%t+(%h)", headers=headers, timeout=5)
+        if r.status_code == 200: return r.text.strip()
+        return "⚠️ 暫時無法取得天氣"
+    except: return "❌ 連線失敗"
 
 def get_stock(symbol):
     try:
         if not symbol: return "請輸入代號"
         ticker = yf.Ticker(symbol.upper())
-        hist = ticker.history(period="2d") # Get 2 days to compare
+        hist = ticker.history(period="5d") # Get enough days
         if hist.empty: return f"❌ 找不到 {symbol}"
         
         price = hist['Close'].iloc[-1]
@@ -275,80 +254,64 @@ def get_stock(symbol):
             status_str = f"{arrow} ${price:.2f} ({sign}{change:.2f} / {sign}{pct:.2f}%)"
         except:
             status_str = f"${price:.2f}"
-        
+            
         prompt = f"""
         Stock: {symbol} ({status_str}). 
-        Role: Lumio (Sweet Girlfriend + Financial Analyst). 
-        Language: Traditional Chinese (Taiwan) ONLY.
-        Task: Short analysis (max 100 words).
+        Role: Financial Analyst (Traditional Chinese).
+        Task: Short analysis (max 80 words).
         """
         res = openai.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}])
         return f"📈 **{symbol}**: {status_str}\n\n{res.choices[0].message.content}"
     except: return "❌ 查詢失敗"
 
-from googlesearch import search as g_search
-
 def search_web(q):
     results = []
-    # 1. Try DuckDuckGo (Primary)
+    # 1. DuckDuckGo
     try:
         with DDGS() as ddgs:
-            ddg_gen = ddgs.text(q, max_results=3)
-            if ddg_gen:
-                results = [f"- [{r['title']}]({r['href']})" for r in ddg_gen]
-    except Exception as e:
-        logger.error(f"DDG Search failed: {e}")
+            gen = ddgs.text(q, max_results=3)
+            if gen: results = [f"- [{r['title']}]({r['href']})" for r in gen]
+    except Exception as e: logger.error(f"DDG: {e}")
     
-    # 2. Fallback to Google Search (Secondary)
+    # 2. Google Fallback
+    if not results and g_search:
+        try:
+            logger.info("🔄 Google Fallback...")
+            for r in g_search(q, num_results=3, advanced=True):
+                t = getattr(r, 'title', r.url)
+                l = getattr(r, 'url', str(r))
+                results.append(f"- [{t}]({l})")
+        except Exception as e: logger.error(f"Google: {e}")
+
+    # 3. GPT-4o Fallback
     if not results:
         try:
-            logger.info("🔄 Switching to Google Search fallback...")
-            # Attempt advanced search for titles
-            g_res = g_search(q, num_results=3, advanced=True)
-            for r in g_res:
-                # Safety check for object attributes
-                title = getattr(r, 'title', r.url)
-                link = getattr(r, 'url', str(r))
-                results.append(f"- [{title}]({link})")
-        except Exception as e:
-            logger.error(f"Google Search failed: {e}")
-            return "❌ 搜尋失敗 (所有引擎皆無回應)"
-
-    if not results:
-        return "❌ 找不到相關結果"
+            prompt = f"Search '{q}' failed. Provide a short summary based on knowledge."
+            res = openai.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}])
+            return f"⚠️ 搜尋無回應，AI 補充:\n\n{res.choices[0].message.content}"
+        except: return "❌ 搜尋功能暫時失效"
         
     return "🔍 **搜尋結果**:\n" + "\n".join(results)
 
 def ai_chat(text):
     try:
-        # Context Injection
-        now = datetime.datetime.now()
+        now = get_now()
         time_str = now.strftime('%Y-%m-%d %H:%M')
         weekday = ["一","二","三","四","五","六","日"][now.weekday()]
         
         weather_context = ""
         if "天氣" in text or "weather" in text.lower(): 
-            weather_context = f" [Current Taipei Weather: {get_weather('Taipei')}]"
+            weather_context = f" [Taipei Weather: {get_weather('Taipei')}]"
             
         system_prompt = f"""
-        You are Lumio (盧米奧), an advanced AI assistant with a sweet, girlfriend-like personality.
+        You are Lumio (盧米奧), an advanced AI assistant with a sweet personality.
+        🕒 Time: {time_str} (週{weekday}) | Location: Taipei {weather_context}
         
-        🕒 **CURRENT CONTEXT**:
-        - Time: {time_str} (週{weekday})
-        - Location: Taipei
-        {weather_context}
+        🎯 **MODES**:
+        1. **❤️ Sweet Girlfriend** (Default): Chat, daily life, feelings. Use emojis.
+        2. **🧠 Professional Assistant** (Tasks): Edit, Translate, Analyze. Be precise, less emojis.
         
-        🎯 **YOUR MODES (Dynamic Switching)**:
-        1. **❤️ Sweet Girlfriend Mode** (Default):
-           - If user says ordinary things.
-           - Be sweet, caring. If it's late (after 00:00), ask user to sleep.
-           - If it's morning, say good morning.
-           
-        2. **🧠 Professional Assistant Mode**:
-           - If user asks for tasks (Edit, Translate, Analyze).
-           - Be precise and clear.
-        
-        🌍 **LANGUAGE**: Traditional Chinese (Taiwan).
+        🌍 Language: Traditional Chinese (Taiwan).
         """
         res = openai.chat.completions.create(
             model="gpt-4o", 
@@ -356,206 +319,128 @@ def ai_chat(text):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": text}
             ],
-            temperature=0.7 
+            temperature=0.7
         )
         return res.choices[0].message.content
-    except: return "嗚嗚... 親愛的我的腦袋有點卡住了 🥺"
+    except: return "腦袋運轉中... 請稍後再試 🥺"
 
 # =========================================
-#       SUPER AI ROUTER (V10.0)
+#       ROUTER
 # =========================================
 def process_command(text, user_id, chat_id, platform="telegram"):
-    """
-    Handles explicit commands AND natural language intents.
-    """
     if not text: return ""
     
-    # 1. Explicit Slash Command Handling (Fast Path)
-    if text.strip().startswith('/'):
+    # Simple Commands
+    if text.startswith('/'):
         parts = text.strip().split()
         cmd = parts[0].lower().replace('/', '')
-        args = parts[1:]
-        arg_str = ' '.join(args)
-
-        if cmd == 'start': return "👋 Lumio V10.0 (Agent版) 上線！親愛的久等了 ❤️"
-        if cmd == 'help': return "🤖 **指令**:\n/add, /delete, /today, /stock, /weather"
+        arg_str = ' '.join(parts[1:])
         
+        if cmd == 'start': return "👋 Lumio V13.0 全能型上線！"
+        if cmd == 'help': return "🤖 指令: /add, /today, /stock, /weather"
         if cmd == 'add': return add_event(arg_str)
         if cmd == 'delete': return delete_event(arg_str)
         if cmd == 'update': return update_event(arg_str)
         if cmd == 'today': return list_events(1)
         if cmd == 'week': return list_events(7)
         if cmd == 'spend': 
-            try: return f"💸 已記帳: {args[1]} ${args[0]}" if add_to_google_sheet(dt_date.today().isoformat(), args[1], float(args[0]), ' '.join(args[2:])) else "❌ 失敗"
+            try: return f"💸 已記帳: {parts[2]} ${parts[1]}" if add_to_google_sheet(get_now().strftime('%Y-%m-%d'), parts[2], float(parts[1]), ' '.join(parts[3:])) else "❌ 失敗"
             except: return "格式: /spend 100 午餐"
         if cmd == 'report': return get_monthly_report()
         if cmd == 'stock': return get_stock(arg_str)
-        if cmd == 'weather': return get_weather(arg_str if arg_str else 'Taipei')
+        if cmd == 'weather': return get_weather(arg_str or 'Taipei')
         if cmd == 's': return search_web(arg_str)
 
-    # 2. AI Intent Classification (The Brain)
+    # Natural Language Router
     system_prompt = """
-    Classify user input into one of these intents:
-    - ADD_EVENT (e.g. "Add meeting tomorrow", "新增行程", "幫我記明天開會")
-    - DELETE_EVENT (e.g. "Cancel meeting", "刪除行程")
-    - LIST_EVENTS (e.g. "What's up today", "今天有什麼事", "查詢行程", "近期行程", "未來七天")
-    - SPEND (e.g. "Lunch 150", "記帳 午餐 150", "晚餐 200", "花費 300 計程車")
-    - REPORT (e.g. "Spending report", "報表", "這個月花多少")
-    - STOCK (e.g. "TSLA price", "台積電股價", "2330", "查詢AAPL", "分析台積電")
-    - WEATHER (e.g. "Taipei weather", "天氣", "台北天氣")
-    - SEARCH (e.g. "Search for apple", "搜尋金澤景點", "查一下...")
-    - CHAT (General conversation, feelings, greetings)
+    Classify intent:
+    - ADD_EVENT (e.g. "新增行程", "明天開會")
+    - DELETE_EVENT (e.g. "取消開會")
+    - LIST_EVENTS (e.g. "今天行程", "一週行程")
+    - SPEND (e.g. "記帳 午餐 150", "花費")
+    - REPORT (e.g. "報表")
+    - STOCK (e.g. "台積電股價", "2330", "查詢AAPL")
+    - WEATHER (e.g. "天氣")
+    - SEARCH (e.g. "搜尋", "查一下")
+    - CHAT (Default)
 
-    Return JSON: {"intent": "INTENT_NAME", "args": "extracted_content"}
-    
-    Rules for 'args':
-    - SPEND: "amount category [note]" (Amount First!).
-    - STOCK: The SYMBOL or COMPANY NAME ONLY. Remove "查詢", "股價", "price", "stock". (e.g. "查詢AAPL" -> "AAPL").
-    - DELETE: The Event Name or Keywords ONLY. Remove "刪除", "取消", dates if possible. (e.g. "刪除開會" -> "開會").
-    - SEARCH: The search keywords ONLY. Remove "搜尋", "查詢", "查一下".
-    - LIST_EVENTS: Original text.
-    - OTHERS: Original text.
+    Return JSON: {"intent": "INTENT", "args": "content"}
+    Rules:
+    - SPEND: "amount category [note]" (Amount First!)
+    - STOCK: SYMBOL ONLY (Remove '查詢', 'price').
+    - DELETE: Keywords ONLY.
+    - SEARCH: Keywords ONLY.
     """
-    
     try:
-        # GPT Call
-        res = openai.chat.completions.create(
-            model="gpt-4o", 
-            messages=[
-                {"role": "system", "content": system_prompt}, 
-                {"role": "user", "content": text}
-            ],
-            temperature=0
-        )
+        res = openai.chat.completions.create(model="gpt-4o", messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": text}], temperature=0)
         content = res.choices[0].message.content.strip()
+        start = content.find('{'); end = content.rfind('}')
+        if start != -1:
+            js = json.loads(content[start:end+1])
+            intent = js.get('intent', 'CHAT')
+            args = js.get('args', text)
+        else: intent = 'CHAT'; args = text
         
-        # Clean JSON
-        start_idx = content.find('{')
-        end_idx = content.rfind('}')
-        if start_idx != -1 and end_idx != -1:
-            json_str = content[start_idx : end_idx + 1]
-            try:
-                js = json.loads(json_str)
-                intent = js.get('intent', 'CHAT')
-                args = js.get('args', text)
-            except:
-                intent = 'CHAT'; args = text
-        else:
-            intent = 'CHAT'; args = text
+        # Safety Nets
+        if intent == 'CHAT' and ('記帳' in text or 'spend' in text.lower()): intent = 'SPEND'; args = text
 
-        print(f"DEBUG: Action -> {intent} | Args -> {args}") 
-
-        # 3. Intent Routing
-        
-        # SAFETY NET: Force Spend if keyword match
-        if intent == 'CHAT' and ('記帳' in text or 'spend' in text.lower()):
-            intent = 'SPEND'; args = text
-
-        if intent == 'ADD_EVENT': return add_event(text) # AI will extract JSON inside add_event
-        
-        if intent == 'DELETE_EVENT': 
-            # If AI extracted just the keyword (e.g. "開會"), delete_event works better
-            return delete_event(args)
-            
-        if intent == 'LIST_EVENTS': 
-            # Check for 7 days / week
-            if any(k in args for k in ['7', '七', 'week', '週']):
-                return list_events(7)
-            return list_events(1)
-        
+        if intent == 'ADD_EVENT': return add_event(text)
+        if intent == 'DELETE_EVENT': return delete_event(args)
+        if intent == 'LIST_EVENTS': return list_events(7 if any(k in args for k in ['7', '七', 'week', '週']) else 1)
         if intent == 'SPEND':
-            # Spending logic with regex fallback
+            # Extract number
             try:
-                # Regex to find amount
                 nums = re.findall(r'\d+(?:\.\d+)?', args)
                 if nums:
                     amt = float(nums[0])
-                    # Remove amt and keywords
-                    clean_text = re.sub(r'\d+(?:\.\d+)?|記帳|spend', '', args, flags=re.IGNORECASE).strip()
-                    if not clean_text: clean_text = "雜支"
-                    
-                    if add_to_google_sheet(dt_date.today().isoformat(), clean_text, amt, text):
-                         return f"💸 已記帳: {clean_text} ${amt}"
+                    clean = re.sub(r'\d+(?:\.\d+)?|記帳|spend', '', args, flags=re.IGNORECASE).strip() or "雜支"
+                    if add_to_google_sheet(get_now().strftime('%Y-%m-%d'), clean, amt, text): return f"💸 已記帳: {clean} ${amt}"
             except: pass
-            return "❌ 記帳失敗，請說「記帳 200 午餐」"
+            return "❌ 記帳失敗 (例: 記帳 100 午餐)"
             
         if intent == 'REPORT': return get_monthly_report()
         if intent == 'STOCK': return get_stock(args)
         if intent == 'WEATHER': return get_weather(args)
         if intent == 'SEARCH': return search_web(args)
-        
-        # Fallback to CHAT
+
         return ai_chat(text)
-        
-    except Exception as e:
-        logger.error(f"Intent Error: {e}")
-        return ai_chat(text)
+    except: return ai_chat(text)
 
 # =========================================
-#       HANDLERS & SERVER
+#       HANDLERS
 # =========================================
-
-# Telegram
 async def t_cmd_wrapper(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    text = u.message.text
-    resp = process_command(text, u.effective_user.id, u.effective_chat.id, "telegram")
-    await u.message.reply_text(resp, parse_mode=ParseMode.MARKDOWN)
+    await u.message.reply_text(process_command(u.message.text, u.effective_user.id, u.effective_chat.id, "telegram"), parse_mode=ParseMode.MARKDOWN)
 
 async def tg_msg_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    text = u.message.text
-    if text and not text.startswith('/'):
-        resp = process_command(text, u.effective_user.id, u.effective_chat.id, "telegram")
-        await u.message.reply_text(resp)
+    if u.message.text and not u.message.text.startswith('/'):
+        await u.message.reply_text(process_command(u.message.text, u.effective_user.id, u.effective_chat.id, "telegram"))
 
-# LINE
+# LINE Flask
 app_flask = Flask(__name__)
-
-if LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET:
+if LINE_CHANNEL_ACCESS_TOKEN:
     line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
     handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
     @app_flask.route("/callback", methods=['POST'])
     def callback():
-        signature = request.headers['X-Line-Signature']
-        body = request.get_data(as_text=True)
-        try: handler.handle(body, signature)
+        try: handler.handle(request.get_data(as_text=True), request.headers['X-Line-Signature'])
         except InvalidSignatureError: abort(400)
         return 'OK'
 
     @handler.add(MessageEvent, message=TextMessage)
     def handle_line_message(event):
-        text = event.message.text
-        user_id = event.source.user_id
-        # LINE entry point
-        resp = process_command(text, user_id, user_id, "line")
+        resp = process_command(event.message.text, event.source.user_id, event.source.user_id, "line")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=resp))
 
-def run_flask():
-    app_flask.run(host='0.0.0.0', port=5000, use_reloader=False)
+def run_flask(): app_flask.run(host='0.0.0.0', port=5000, use_reloader=False)
 
-# =========================================
-#       MAIN EXECUTION
-# =========================================
 if __name__ == '__main__':
-    # Flask Thread (LINE)
     if LINE_CHANNEL_ACCESS_TOKEN:
-        logger.info("🟢 Starting LINE Bot (Flask)...")
-        t = threading.Thread(target=run_flask)
-        t.daemon = True
-        t.start()
-    
-    # Telegram Polling (Main Thread)
+        t = threading.Thread(target=run_flask); t.daemon = True; t.start()
     if TELEGRAM_TOKEN:
-        logger.info("🔵 Starting Telegram Bot...")
-        app_tg = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-        
-        # Commands
+        app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
         for cmd in ['start', 'help', 'add', 'delete', 'update', 'today', 'week', 'spend', 'report', 'stock', 'weather', 's', 'remind']:
-            app_tg.add_handler(CommandHandler(cmd, t_cmd_wrapper))
-            
-        # Messages (AI Router)
-        app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), tg_msg_handler))
-        
-        app_tg.run_polling()
-    else:
-        logger.error("❌ Telegram Token missing! App might exit.")
+            app.add_handler(CommandHandler(cmd, t_cmd_wrapper))
+        app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), tg_msg_handler))
+        app.run_polling()
