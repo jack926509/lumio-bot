@@ -8,3 +8,6 @@ yfinance
 duckduckgo-search==5.3.1
 requests
 dateparser
+flask
+line-bot-sdk
+pyngrok
