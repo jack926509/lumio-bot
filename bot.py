@@ -8,6 +8,7 @@ import traceback
 import re
 import threading
 import requests
+import time
 from datetime import date as dt_date, timedelta, timezone
 
 # --- Third Party Libraries ---
@@ -21,6 +22,7 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 import openai
+client = openai.OpenAI()
 from dotenv import load_dotenv
 import yfinance as yf
 from duckduckgo_search import DDGS
@@ -93,7 +95,9 @@ def get_google_creds():
 def add_to_google_sheet(date, category, amount, note):
     try:
         creds = get_google_creds()
-        if not creds: return False
+        if not creds: 
+            logger.error("Google credentials not found or invalid.")
+            return False
         
         client = gspread.authorize(creds)
         try: sh = client.open(SPREADSHEET_NAME)
@@ -116,7 +120,9 @@ def add_to_google_sheet(date, category, amount, note):
 def get_monthly_report():
     try:
         creds = get_google_creds()
-        if not creds: return "❌ 無法連接 Google Sheets"
+        if not creds: 
+            logger.error("Google credentials not found or invalid for Google Sheets.")
+            return "❌ 無法連接 Google Sheets"
         client = gspread.authorize(creds)
         try: sheet = client.open(SPREADSHEET_NAME).worksheet("records")
         except: return "❌ 找不到 'records' 工作表"
@@ -145,9 +151,10 @@ def get_monthly_report():
 # --- Calendar ---
 def get_cal_service():
     creds = get_google_creds()
-    if not creds: return None
-    return build('calendar', 'v3', credentials=creds)
-
+    if not creds: 
+        logger.error("Google credentials not found or invalid for Google Calendar.")
+        return None
+    return build(\'calendar\', \'v3\', credentials=creds)
 def add_event(text):
     try:
         service = get_cal_service()
@@ -160,7 +167,7 @@ def add_event(text):
         Ref Date: {get_now().strftime('%Y-%m-%d')}
         timezone: Asia/Taipei
         """
-        res = openai.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}])
+        res = client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}])
         content = res.choices[0].message.content.strip()
         
         start_idx = content.find('{')
@@ -240,6 +247,10 @@ def get_weather(location="Taipei"):
 def get_stock(symbol):
     try:
         if not symbol: return "請輸入代號"
+        
+        # 處理台股代號
+        if symbol.isdigit() and not (symbol.endswith(".TW") or symbol.endswith(".TWO")):
+            symbol = f"{symbol}.TW"
         ticker = yf.Ticker(symbol.upper())
         hist = ticker.history(period="5d") # Get enough days
         if hist.empty: return f"❌ 找不到 {symbol}"
@@ -260,18 +271,23 @@ def get_stock(symbol):
         Role: Financial Analyst (Traditional Chinese).
         Task: Short analysis (max 80 words).
         """
-        res = openai.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}])
+        res = client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}])
         return f"📈 **{symbol}**: {status_str}\n\n{res.choices[0].message.content}"
     except: return "❌ 查詢失敗"
 
 def search_web(q):
     results = []
     # 1. DuckDuckGo
-    try:
-        with DDGS() as ddgs:
-            gen = ddgs.text(q, max_results=3)
-            if gen: results = [f"- [{r['title']}]({r['href']})" for r in gen]
-    except Exception as e: logger.error(f"DDG: {e}")
+    for _ in range(3): # Retry up to 3 times
+        try:
+            with DDGS() as ddgs:
+                gen = ddgs.text(q, max_results=3)
+                if gen: results = [f"- [{r[\'title\']}]({r[\'href\']})" for r in gen]
+                break # If successful, break the loop
+        except Exception as e:
+            logger.error(f"DDG search failed: {e}. Retrying...")
+            time.sleep(2) # Wait for 2 seconds before retrying
+    
     
     # 2. Google Fallback
     if not results and g_search:
@@ -287,7 +303,7 @@ def search_web(q):
     if not results:
         try:
             prompt = f"User asked to search: '{q}', but search engines failed. Provide a comprehensive answer in Traditional Chinese (Taiwan) ONLY. Structure it clearly."
-            res = openai.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}])
+            res = client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}])
             return f"⚠️ 搜尋引擎無回應，AI 補充資訊:\n\n{res.choices[0].message.content}"
         except: return "❌ 搜尋功能暫時失效"
         
@@ -313,7 +329,7 @@ def ai_chat(text):
         
         🌍 Language: Traditional Chinese (Taiwan).
         """
-        res = openai.chat.completions.create(
+        res = client.chat.completions.create(
             model="gpt-4o", 
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -372,7 +388,7 @@ def process_command(text, user_id, chat_id, platform="telegram"):
     - SEARCH: Keywords ONLY.
     """
     try:
-        res = openai.chat.completions.create(model="gpt-4o", messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": text}], temperature=0)
+        res = client.chat.completions.create(model="gpt-4o", messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": text}], temperature=0)
         content = res.choices[0].message.content.strip()
         start = content.find('{'); end = content.rfind('}')
         if start != -1:
