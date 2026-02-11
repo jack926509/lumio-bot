@@ -154,7 +154,7 @@ def get_cal_service():
     if not creds: 
         logger.error("Google credentials not found or invalid for Google Calendar.")
         return None
-    return build(\'calendar\', \'v3\', credentials=creds)
+    return build('calendar', 'v3', credentials=creds)
 def add_event(text):
     try:
         service = get_cal_service()
@@ -282,7 +282,7 @@ def search_web(q):
         try:
             with DDGS() as ddgs:
                 gen = ddgs.text(q, max_results=3)
-                if gen: results = [f"- [{r[\'title\']}]({r[\'href\']})" for r in gen]
+                if gen: results = [f"- [{r['title']}]({r['href']})" for r in gen]
                 break # If successful, break the loop
         except Exception as e:
             logger.error(f"DDG search failed: {e}. Retrying...")
@@ -320,7 +320,7 @@ def ai_chat(text):
             weather_context = f" [Taipei Weather: {get_weather('Taipei')}]"
             
         system_prompt = f"""
-        You are Lumio (盧米奧), an advanced AI assistant with a sweet personality.
+        You are Lumio, an advanced AI assistant with a sweet personality.
         🕒 Time: {time_str} (週{weekday}) | Location: Taipei {weather_context}
         
         🎯 **MODES**:
